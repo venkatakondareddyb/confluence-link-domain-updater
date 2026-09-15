@@ -1,39 +1,32 @@
-const SRC = "confluence-link-updater";
-
-// Selectors live in Advanced so a DOM change in Confluence doesn't mean a reinstall.
-const DEFAULTS = {
-  matchValue: "gitlab.com",
-  replaceValue: "gitlab-dedicated.com",
+// Baked-in defaults for the automation. Update here if Confluence's DOM
+// changes and the automation stops finding the edit/save UI.
+const SELECTORS = {
   editBtn: 'button[datalink-id="edit-link"]',
   urlInput: 'input[datatest-id="link-url"]',
   saveBtn: 'button[datalink-id="save-link"]',
-  stepDelay: 800,
 };
+const STEP_DELAY = 800; // ms between UI steps
 
-const els = Object.fromEntries(
-  [
-    "matchValue",
-    "replaceValue",
-    "editBtn",
-    "urlInput",
-    "saveBtn",
-    "stepDelay",
-    "scanBtn",
-    "runBtn",
-    "stopBtn",
-    "clearBtn",
-    "resetDefaultsBtn",
-    "statusLine",
-    "logBody",
-  ].map((id) => [id, document.getElementById(id)])
-);
-
-let tabId = null;
-
-// --- rendering ---------------------------------------------------------
+const els = {
+  matchValue: document.getElementById("matchValue"),
+  replaceValue: document.getElementById("replaceValue"),
+  scanBtn: document.getElementById("scanBtn"),
+  runBtn: document.getElementById("runBtn"),
+  stopBtn: document.getElementById("stopBtn"),
+  clearBtn: document.getElementById("clearBtn"),
+  statusLine: document.getElementById("statusLine"),
+  logBody: document.getElementById("logBody"),
+};
 
 function setStatus(text) {
   els.statusLine.textContent = text || "";
+}
+
+async function clearLog() {
+  els.logBody.innerHTML = "";
+  setStatus("");
+  const tab = await getActiveTab();
+  await chrome.storage.session.remove(`results:${tab.id}`);
 }
 
 function autoGrow(textarea) {
@@ -41,7 +34,58 @@ function autoGrow(textarea) {
   textarea.style.height = textarea.scrollHeight + "px";
 }
 
-function upsertRow({ index, oldUrl, newUrl, touched, status, message }) {
+function getRowStatus(statusCell) {
+  const cls = Array.from(statusCell.classList).find(
+    (c) => c.startsWith("status-") && c !== "status-cell"
+  );
+  return cls ? cls.replace("status-", "") : undefined;
+}
+
+function collectRowsData() {
+  return Array.from(els.logBody.querySelectorAll("tr")).map((row) => {
+    const input = row.querySelector(".updated-url-input");
+    const statusCell = row.querySelector(".status-cell");
+    return {
+      index: parseInt(row.id.replace("log-row-", ""), 10),
+      oldUrl: row.dataset.oldUrl,
+      newUrl: input.value,
+      touched: input.dataset.touched === "1",
+      status: getRowStatus(statusCell),
+      message: statusCell.title || undefined,
+    };
+  });
+}
+
+async function saveSnapshot() {
+  const tab = await getActiveTab();
+  await chrome.storage.session.set({
+    [`results:${tab.id}`]: {
+      statusText: els.statusLine.textContent,
+      rows: collectRowsData(),
+    },
+  });
+}
+
+function restoreRow(r) {
+  upsertRow({ index: r.index, oldUrl: r.oldUrl, status: r.status, message: r.message });
+  const row = document.getElementById(`log-row-${r.index}`);
+  const input = row.querySelector(".updated-url-input");
+  input.value = r.newUrl;
+  if (r.touched) input.dataset.touched = "1";
+  autoGrow(input);
+}
+
+async function restoreResults() {
+  const tab = await getActiveTab();
+  const key = `results:${tab.id}`;
+  const stored = await chrome.storage.session.get(key);
+  const data = stored[key];
+  if (!data) return;
+  setStatus(data.statusText || "");
+  data.rows.forEach(restoreRow);
+}
+
+function upsertRow({ index, oldUrl, newUrl, status, message }) {
   let row = document.getElementById(`log-row-${index}`);
   if (!row) {
     row = document.createElement("tr");
@@ -52,150 +96,119 @@ function upsertRow({ index, oldUrl, newUrl, touched, status, message }) {
         <div class="original-url"></div>
         <div class="updated-url-row">
           <span class="bullet">↳</span>
-          <textarea class="updated-url-input" rows="1" spellcheck="false"></textarea>
+          <textarea class="updated-url-input" rows="1"></textarea>
         </div>
       </td>
       <td class="status-cell"></td>
     `;
     els.logBody.appendChild(row);
-    row.querySelector(".updated-url-input").addEventListener("input", (e) => {
+    const textarea = row.querySelector(".updated-url-input");
+    textarea.addEventListener("input", (e) => {
       e.target.dataset.touched = "1";
       autoGrow(e.target);
-      send({ type: "patch", from: "popup", index, newUrl: e.target.value, touched: true });
+      saveSnapshot();
     });
   }
-
-  const urlCell = row.querySelector(".url-cell");
-  const statusCell = row.querySelector(".status-cell");
-  const input = urlCell.querySelector(".updated-url-input");
-
+  const [, urlCell, statusCell] = row.children;
+  const oldDiv = urlCell.querySelector(".original-url");
+  const newInput = urlCell.querySelector(".updated-url-input");
   if (oldUrl !== undefined) {
-    urlCell.querySelector(".original-url").textContent = oldUrl;
+    oldDiv.textContent = oldUrl;
     row.dataset.oldUrl = oldUrl;
   }
-  if (touched) input.dataset.touched = "1";
-  if (newUrl !== undefined && (touched || !input.dataset.touched) && input.value !== newUrl) {
-    input.value = newUrl;
-    autoGrow(input);
+  // Don't clobber a value the user already tweaked by hand
+  if (newUrl !== undefined && !newInput.dataset.touched) {
+    newInput.value = newUrl;
+    autoGrow(newInput);
   }
   if (status !== undefined) {
     statusCell.textContent = message || status;
     statusCell.title = message || "";
     statusCell.className = "status-cell status-" + status;
-    row.scrollIntoView({ block: "nearest" });
   }
+  row.scrollIntoView({ block: "nearest" });
 }
 
-function setRunning(running) {
-  els.scanBtn.disabled = running;
-  els.runBtn.disabled = running;
-  els.clearBtn.disabled = running;
-  els.logBody.querySelectorAll(".updated-url-input").forEach((i) => (i.disabled = running));
+function getPlanFromTable() {
+  return Array.from(els.logBody.querySelectorAll("tr"))
+    .map((row) => ({
+      index: parseInt(row.id.replace("log-row-", ""), 10),
+      oldUrl: row.dataset.oldUrl,
+      newUrl: row.querySelector(".updated-url-input")?.value.trim(),
+    }))
+    .filter((entry) => entry.oldUrl && entry.newUrl);
 }
 
-function render(state) {
-  setStatus(state.status);
-  Object.values(state.rows)
-    .sort((a, b) => a.index - b.index)
-    .forEach(upsertRow);
-  setRunning(state.running);
+function setRowsEditable(editable) {
+  els.logBody.querySelectorAll(".updated-url-input").forEach((input) => {
+    input.disabled = !editable;
+  });
 }
 
-// --- state / config ----------------------------------------------------
-
-function send(msg) {
-  chrome.runtime.sendMessage({ source: SRC, tabId, ...msg }).catch(() => {});
-}
-
-function readConfig() {
-  const delay = parseInt(els.stepDelay.value, 10);
+function getConfig() {
   return {
     matchValue: els.matchValue.value.trim(),
     replaceValue: els.replaceValue.value.trim(),
-    editBtn: els.editBtn.value.trim(),
-    urlInput: els.urlInput.value.trim(),
-    saveBtn: els.saveBtn.value.trim(),
-    stepDelay: Number.isFinite(delay) ? delay : DEFAULTS.stepDelay,
+    selectors: SELECTORS,
+    stepDelay: STEP_DELAY,
   };
 }
 
-function writeConfig(config) {
-  Object.keys(DEFAULTS).forEach((k) => (els[k].value = config[k]));
+async function restoreSettings() {
+  const stored = await chrome.storage.sync.get({
+    matchValue: "gitlab.com",
+    replaceValue: "gitlab-dedicated.com",
+  });
+  els.matchValue.value = stored.matchValue;
+  els.replaceValue.value = stored.replaceValue;
 }
 
-function toInjectable(config) {
-  return {
+function saveSettings(config) {
+  chrome.storage.sync.set({
     matchValue: config.matchValue,
     replaceValue: config.replaceValue,
-    stepDelay: config.stepDelay,
-    selectors: { editBtn: config.editBtn, urlInput: config.urlInput, saveBtn: config.saveBtn },
-  };
+  });
 }
 
-async function inject(func, args) {
-  try {
-    await chrome.scripting.executeScript({ target: { tabId }, func, args });
-    return true;
-  } catch (err) {
-    setStatus(`Can't run here: ${err.message}`);
-    setRunning(false);
-    return false;
-  }
+async function getActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
 }
 
-function clearTable() {
-  els.logBody.innerHTML = "";
-  setStatus("");
-}
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.source !== "confluence-link-updater") return;
+  if (message.type === "summary") setStatus(message.text);
+  else if (message.type === "row") upsertRow(message);
+  saveSnapshot();
+});
 
-// --- injected: scan ----------------------------------------------------
-
+// ---------------------------------------------------------------
+// Injected into the page via chrome.scripting.executeScript.
+// Runs in an isolated content-script world (chrome.runtime available,
+// page's own JS globals are not).
+// ---------------------------------------------------------------
 function injectedScan(config) {
-  const send = (msg) => {
-    const p = chrome.runtime.sendMessage({ source: "confluence-link-updater", ...msg });
-    if (p?.catch) p.catch(() => {});
-  };
-
+  const send = (msg) => chrome.runtime.sendMessage({ source: "confluence-link-updater", ...msg });
   const links = Array.from(document.querySelectorAll("a[href]")).filter((a) =>
     a.getAttribute("href").includes(config.matchValue)
   );
 
+  send({ type: "summary", text: `Scan complete: ${links.length} matching link(s) found.` });
+
   links.forEach((a, index) => {
     const oldUrl = a.getAttribute("href");
-    send({
-      type: "row",
-      index,
-      oldUrl,
-      newUrl: oldUrl.split(config.matchValue).join(config.replaceValue),
-      status: "match",
-      message: "match found",
-    });
+    const newUrl = oldUrl.split(config.matchValue).join(config.replaceValue);
+    send({ type: "row", index, oldUrl, newUrl, status: "match", message: "match found" });
   });
 
-  send({
-    type: "summary",
-    text: links.length
-      ? `${links.length} matching link(s). Review the new URLs, then Run.`
-      : `No links containing "${config.matchValue}". Open the page in edit mode and rescan.`,
-  });
+  return links.length;
 }
 
-// --- injected: run -----------------------------------------------------
-// Isolated content-script world: chrome.runtime is available, page globals are not.
-
 function injectedRun(config) {
-  const send = (msg) => {
-    const p = chrome.runtime.sendMessage({ source: "confluence-link-updater", ...msg });
-    if (p?.catch) p.catch(() => {});
-  };
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  window.__cluStop = false;
 
-  if (globalThis.__cluRunning) {
-    send({ type: "summary", text: "A run is already in progress on this tab." });
-    return;
-  }
-  globalThis.__cluRunning = true;
-  globalThis.__cluStop = false;
+  const send = (msg) => chrome.runtime.sendMessage({ source: "confluence-link-updater", ...msg });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function waitFor(checkFn, timeoutMs = 4000) {
     return new Promise((resolve) => {
@@ -211,7 +224,9 @@ function injectedRun(config) {
           resolve(el);
         }
       });
+
       observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+
       timer = setTimeout(() => {
         observer.disconnect();
         resolve(null);
@@ -232,36 +247,21 @@ function injectedRun(config) {
     });
   }
 
-  // Several rows can share an href; never hand the same node out twice.
-  const claimed = new WeakSet();
-  function findLink(href) {
+  function findLinkByHref(href) {
     return Array.from(document.querySelectorAll("a[href]")).find(
-      (a) => a.getAttribute("href") === href && !claimed.has(a)
+      (a) => a.getAttribute("href") === href
     );
   }
 
-  function typeInto(input, value) {
-    input.focus();
-    input.setSelectionRange(0, input.value.length);
-    document.execCommand("insertText", false, value);
-    if (input.value === value) return;
-    // execCommand is on its way out; fall back to the native setter so the
-    // editor's React state still sees a real input event.
-    const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement : HTMLInputElement;
-    Object.getOwnPropertyDescriptor(proto.prototype, "value").set.call(input, value);
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  }
+  async function processEntry(entry) {
+    const { index, oldUrl, newUrl } = entry;
+    send({ index, status: "pending", type: "row" });
 
-  async function processEntry({ index, oldUrl, newUrl }) {
-    send({ type: "row", index, status: "pending", message: "working" });
-
-    const link = findLink(oldUrl);
+    const link = findLinkByHref(oldUrl);
     if (!link) {
-      send({ type: "row", index, status: "error", message: "link not on page — rescan" });
-      return { ok: false };
+      send({ index, status: "error", message: "link not found on page (did the page change since scan?)", type: "row" });
+      return false;
     }
-    claimed.add(link);
 
     link.closest('[contenteditable="true"]')?.focus();
 
@@ -276,139 +276,102 @@ function injectedRun(config) {
 
     const editBtn = await waitFor(() => document.querySelector(config.selectors.editBtn));
     if (!editBtn) {
-      send({ type: "row", index, status: "error", message: "edit-link button not found" });
-      return { ok: false, fatal: true };
+      send({ index, status: "error", message: "edit-link button not found", type: "row" });
+      return false;
     }
     doClick(editBtn);
 
     const urlInput = await waitFor(() => document.querySelector(config.selectors.urlInput));
     if (!urlInput) {
-      send({ type: "row", index, status: "error", message: "url input not found" });
-      return { ok: false, fatal: true };
+      send({ index, status: "error", message: "url input not found", type: "row" });
+      return false;
     }
-    typeInto(urlInput, newUrl);
+
+    urlInput.focus();
+    urlInput.setSelectionRange(0, urlInput.value.length);
+    document.execCommand("insertText", false, newUrl);
     await sleep(config.stepDelay);
 
     const saveBtn = await waitFor(() => document.querySelector(config.selectors.saveBtn));
     if (!saveBtn) {
-      send({ type: "row", index, status: "error", message: "save button not found" });
-      return { ok: false, fatal: true };
+      send({ index, status: "error", message: "save button not found", type: "row" });
+      return false;
     }
     doClick(saveBtn);
-
-    // The editor may replace the anchor node rather than mutate it, so accept
-    // either the same node updated or a fresh one carrying the new href.
-    const escaped = newUrl.replace(/["\\]/g, "\\$&");
-    const confirmed = await waitFor(
-      () =>
-        (link.isConnected && link.getAttribute("href") === newUrl) ||
-        document.querySelector(`a[href="${escaped}"]`),
-      2000
-    );
     await sleep(config.stepDelay);
 
-    if (!confirmed) {
-      send({ type: "row", index, status: "warn", message: "saved, href unverified" });
-      return { ok: true };
-    }
-    send({ type: "row", index, status: "success", message: "updated" });
-    return { ok: true };
+    send({ index, status: "success", message: "updated", type: "row" });
+    return true;
   }
 
   return (async () => {
-    send({ type: "run-state", running: true });
     const total = config.plan.length;
+    send({ type: "summary", text: `Starting run. ${total} link(s) to update.` });
     let done = 0;
-    let failed = 0;
-    let note = "";
 
-    try {
-      for (const entry of config.plan) {
-        if (globalThis.__cluStop) {
-          note = "Stopped. ";
-          break;
-        }
-        const result = await processEntry(entry);
-        result.ok ? done++ : failed++;
-        if (result.fatal) {
-          // A missing toolbar means the selectors are wrong or the page isn't in
-          // edit mode — every remaining row would fail the same way.
-          note = "Aborted — check the selectors under Advanced, and that the page is in edit mode. ";
-          break;
-        }
-        send({ type: "summary", text: `Updating… ${done}/${total}` });
+    for (const entry of config.plan) {
+      if (window.__cluStop) {
+        send({ type: "summary", text: "Stopped by user." });
+        break;
       }
-      const failures = failed ? `, ${failed} failed` : "";
-      send({
-        type: "summary",
-        text: `${note}${done}/${total} updated${failures}. Now click Confluence's own Update to publish.`,
-      });
-    } finally {
-      globalThis.__cluRunning = false;
-      send({ type: "run-state", running: false });
+      const ok = await processEntry(entry);
+      if (!ok) break;
+      done++;
     }
+
+    send({ type: "summary", text: `Finished. ${done}/${total} updated. Click Confluence's page Save/Update to publish.` });
   })();
 }
 
-// --- wiring ------------------------------------------------------------
+// ---------------------------------------------------------------
 
 els.scanBtn.addEventListener("click", async () => {
-  const config = readConfig();
-  await chrome.storage.sync.set(config);
-  clearTable();
-  send({ type: "reset" });
-  setStatus("Scanning…");
-  await inject(injectedScan, [toInjectable(config)]);
+  const config = getConfig();
+  saveSettings(config);
+  const tab = await getActiveTab();
+  await clearLog();
+  setStatus("Scanning page...");
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: injectedScan,
+    args: [config],
+  });
 });
 
 els.runBtn.addEventListener("click", async () => {
-  const plan = Array.from(els.logBody.querySelectorAll("tr"))
-    .map((row) => ({
-      index: parseInt(row.id.replace("log-row-", ""), 10),
-      oldUrl: row.dataset.oldUrl,
-      newUrl: row.querySelector(".updated-url-input").value.trim(),
-    }))
-    .filter((e) => e.oldUrl && e.newUrl && e.oldUrl !== e.newUrl);
-
-  if (!plan.length) {
-    setStatus("Nothing to update. Scan first, then check the new URLs.");
+  const plan = getPlanFromTable();
+  if (plan.length === 0) {
+    setStatus("Run a scan first, review/tweak the New URL values, then Run.");
     return;
   }
 
-  const config = readConfig();
-  await chrome.storage.sync.set(config);
-  setRunning(true);
-  setStatus(`Updating… 0/${plan.length}`);
-  await inject(injectedRun, [{ ...toInjectable(config), plan }]);
+  const config = getConfig();
+  saveSettings(config);
+  config.plan = plan;
+
+  const tab = await getActiveTab();
+  setRowsEditable(false);
+  setStatus("Running...");
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: injectedRun,
+    args: [config],
+  });
+  setRowsEditable(true);
 });
 
 els.stopBtn.addEventListener("click", async () => {
-  await inject(() => {
-    globalThis.__cluStop = true;
-  }, []);
+  const tab = await getActiveTab();
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: () => { window.__cluStop = true; },
+  });
+  setStatus("Stop signal sent.");
 });
 
-els.clearBtn.addEventListener("click", () => {
-  clearTable();
-  send({ type: "reset" });
+els.clearBtn.addEventListener("click", async () => {
+  await clearLog();
 });
 
-els.resetDefaultsBtn.addEventListener("click", () => {
-  writeConfig(DEFAULTS);
-  chrome.storage.sync.set(DEFAULTS);
-});
-
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg?.source !== SRC || msg.from === "popup") return;
-  if (msg.type === "summary") setStatus(msg.text);
-  else if (msg.type === "row") upsertRow(msg);
-  else if (msg.type === "run-state") setRunning(msg.running);
-});
-
-(async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  tabId = tab.id;
-  writeConfig(await chrome.storage.sync.get(DEFAULTS));
-  const stored = await chrome.storage.session.get(`state:${tabId}`);
-  if (stored[`state:${tabId}`]) render(stored[`state:${tabId}`]);
-})();
+restoreSettings();
+restoreResults();
