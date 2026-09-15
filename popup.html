@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="logo">🔗</div>
+      <div>
+        <h1>Link Updater</h1>
+        <p class="subtitle">for Confluence editor links</p>
+      </div>
+    </header>
+
+    <div class="settings-panel">
+      <div class="match-replace">
+        <div class="input-group">
+          <label for="matchValue">Matched text</label>
+          <input type="text" id="matchValue" spellcheck="false" />
+        </div>
+        <div class="separator">→</div>
+        <div class="input-group">
+          <label for="replaceValue">Replace with</label>
+          <input type="text" id="replaceValue" spellcheck="false" />
+        </div>
+      </div>
+
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div class="advanced-grid">
+          <div class="input-group">
+            <label for="editBtn">Edit-link button</label>
+            <input type="text" id="editBtn" spellcheck="false" />
+          </div>
+          <div class="input-group">
+            <label for="urlInput">URL field</label>
+            <input type="text" id="urlInput" spellcheck="false" />
+          </div>
+          <div class="input-group">
+            <label for="saveBtn">Save button</label>
+            <input type="text" id="saveBtn" spellcheck="false" />
+          </div>
+          <div class="input-group">
+            <label for="stepDelay">Delay between steps (ms)</label>
+            <input type="text" id="stepDelay" spellcheck="false" />
+          </div>
+        </div>
+        <p class="advanced-note">
+          CSS selectors for the link toolbar. Update these if Confluence changes its markup
+          and runs start failing with “button not found”.
+        </p>
+        <button id="resetDefaultsBtn" class="link-button">Reset to defaults</button>
+      </details>
+    </div>
+
+    <div class="button-row">
+      <button id="scanBtn" class="secondary-button">🔍 Scan</button>
+      <button id="runBtn" class="primary-button">▶ Run</button>
+      <button id="stopBtn" class="danger-button" title="Stop after the current link">⏹</button>
+      <button id="clearBtn" class="secondary-button">🧹 Clear</button>
+    </div>
+
+    <div id="statusLine" class="status-message"></div>
+
+    <div class="results-box">
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th class="number-column">#</th>
+            <th>URL change</th>
+            <th class="status-column">Status</th>
+          </tr>
+        </thead>
+        <tbody id="logBody"></tbody>
+      </table>
+      <div id="logEmpty" class="no-results">
+        Open the Confluence page in edit mode, then Scan.
+      </div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
