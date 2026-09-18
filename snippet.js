@@ -83,10 +83,12 @@
       font-size: 10.5px; text-transform: uppercase; padding: 7px 8px; border-bottom: 1px solid #e4e7eb;
     }
     #clu-panel .number-column { width: 24px; }
+    #clu-panel .text-column { width: 110px; }
     #clu-panel .status-column { width: 78px; }
     #clu-panel .results-table td { padding: 6px 8px; border-bottom: 1px solid #f1f2f4; vertical-align: top; }
     #clu-panel .results-table tr:last-child td { border-bottom: none; }
     #clu-panel .results-table tr:hover { background: #f7f8fa; }
+    #clu-panel .text-cell { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #clu-panel .url-cell { font-family: "SFMono-Regular", Consolas, monospace; font-size: 10.8px; line-height: 1.5; word-break: break-all; }
     #clu-panel .original-url { color: #97a0af; text-decoration: line-through; }
     #clu-panel .updated-url-row { display: flex; align-items: flex-start; gap: 5px; margin-top: 3px; }
@@ -149,6 +151,7 @@
         <thead>
           <tr>
             <th class="number-column">#</th>
+            <th class="text-column">Link text</th>
             <th>URL change</th>
             <th class="status-column">Status</th>
           </tr>
@@ -172,6 +175,17 @@
     logBody: panel.querySelector("#clu-logBody"),
   };
 
+  // Single source of truth. Every row carries a direct reference to the
+  // anchor element it came from (`link`), so Run operates on that exact
+  // node instead of re-searching the page by href — safe even when
+  // several links on the page share the same href.
+  const state = {
+    matchValue: "",
+    replaceValue: "",
+    rows: [],
+    stopRequested: false,
+  };
+
   function setStatus(text) {
     els.statusLine.textContent = text || "";
   }
@@ -181,13 +195,14 @@
     textarea.style.height = textarea.scrollHeight + "px";
   }
 
-  function upsertRow({ index, oldUrl, newUrl, status, message }) {
-    let row = panel.querySelector(`#clu-row-${index}`);
+  function renderRow(entry) {
+    let row = panel.querySelector(`#clu-row-${entry.index}`);
     if (!row) {
       row = document.createElement("tr");
-      row.id = `clu-row-${index}`;
+      row.id = `clu-row-${entry.index}`;
       row.innerHTML = `
-        <td>${index + 1}</td>
+        <td>${entry.index + 1}</td>
+        <td class="text-cell"></td>
         <td class="url-cell">
           <div class="original-url"></div>
           <div class="updated-url-row">
@@ -200,38 +215,39 @@
       els.logBody.appendChild(row);
       const textarea = row.querySelector(".updated-url-input");
       textarea.addEventListener("input", (e) => {
-        e.target.dataset.touched = "1";
+        entry.touched = true;
+        entry.newUrl = e.target.value;
         autoGrow(e.target);
       });
     }
-    const [, urlCell, statusCell] = row.children;
+
+    const [, textCell, urlCell, statusCell] = row.children;
     const oldDiv = urlCell.querySelector(".original-url");
     const newInput = urlCell.querySelector(".updated-url-input");
-    if (oldUrl !== undefined) {
-      oldDiv.textContent = oldUrl;
-      row.dataset.oldUrl = oldUrl;
-    }
+
+    textCell.textContent = entry.linkText;
+    textCell.title = entry.linkText;
+
+    oldDiv.textContent = entry.oldUrl;
+    row.dataset.oldUrl = entry.oldUrl;
+
     // Don't clobber a value the user already tweaked by hand
-    if (newUrl !== undefined && !newInput.dataset.touched) {
-      newInput.value = newUrl;
+    if (!entry.touched && newInput.value !== entry.newUrl) {
+      newInput.value = entry.newUrl;
       autoGrow(newInput);
     }
-    if (status !== undefined) {
-      statusCell.textContent = message || status;
-      statusCell.title = message || "";
-      statusCell.className = "status-cell status-" + status;
-    }
+
+    statusCell.textContent = entry.message || entry.status || "";
+    statusCell.title = entry.message || "";
+    statusCell.className = "status-cell" + (entry.status ? " status-" + entry.status : "");
+
     row.scrollIntoView({ block: "nearest" });
   }
 
-  function getPlanFromTable() {
-    return Array.from(els.logBody.querySelectorAll("tr"))
-      .map((row) => ({
-        index: parseInt(row.id.replace("clu-row-", ""), 10),
-        oldUrl: row.dataset.oldUrl,
-        newUrl: row.querySelector(".updated-url-input")?.value.trim(),
-      }))
-      .filter((entry) => entry.oldUrl && entry.newUrl);
+  function setRowStatus(entry, status, message) {
+    entry.status = status;
+    entry.message = message;
+    renderRow(entry);
   }
 
   function setRowsEditable(editable) {
@@ -240,11 +256,9 @@
     });
   }
 
-  function getConfig() {
-    return {
-      matchValue: els.matchValue.value.trim(),
-      replaceValue: els.replaceValue.value.trim(),
-    };
+  function syncConfigFromInputs() {
+    state.matchValue = els.matchValue.value.trim();
+    state.replaceValue = els.replaceValue.value.trim();
   }
 
   function loadSettings() {
@@ -252,36 +266,51 @@
     try {
       saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     } catch {}
-    els.matchValue.value = saved.matchValue ?? "gitlab.com";
-    els.replaceValue.value = saved.replaceValue ?? "gitlab-dedicated.com";
+    state.matchValue = saved.matchValue ?? "gitlab.com";
+    state.replaceValue = saved.replaceValue ?? "gitlab-dedicated.com";
+    els.matchValue.value = state.matchValue;
+    els.replaceValue.value = state.replaceValue;
   }
 
-  function saveSettings(config) {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(config));
+  function saveSettings() {
+    localStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({ matchValue: state.matchValue, replaceValue: state.replaceValue })
+    );
   }
 
   function clearLog() {
+    state.rows = [];
     els.logBody.innerHTML = "";
     setStatus("");
   }
 
   function scan() {
-    const config = getConfig();
-    saveSettings(config);
+    syncConfigFromInputs();
+    saveSettings();
     clearLog();
     setStatus("Scanning page...");
 
     const links = Array.from(document.querySelectorAll("a[href]")).filter((a) =>
-      a.getAttribute("href").includes(config.matchValue)
+      a.getAttribute("href").includes(state.matchValue)
     );
 
-    setStatus(`Scan complete: ${links.length} matching link(s) found.`);
-
-    links.forEach((a, index) => {
-      const oldUrl = a.getAttribute("href");
-      const newUrl = oldUrl.split(config.matchValue).join(config.replaceValue);
-      upsertRow({ index, oldUrl, newUrl, status: "match", message: "match found" });
+    state.rows = links.map((link, index) => {
+      const oldUrl = link.getAttribute("href");
+      return {
+        index,
+        link, // the actual anchor element — Run acts on this, not on a re-lookup by href
+        oldUrl,
+        newUrl: oldUrl.split(state.matchValue).join(state.replaceValue),
+        linkText: link.textContent.trim(),
+        touched: false,
+        status: "match",
+        message: "match found",
+      };
     });
+
+    state.rows.forEach(renderRow);
+    setStatus(`Scan complete: ${state.rows.length} matching link(s) found.`);
   }
 
   function sleep(ms) {
@@ -325,21 +354,14 @@
     });
   }
 
-  function findLinkByHref(href) {
-    return Array.from(document.querySelectorAll("a[href]")).find(
-      (a) => a.getAttribute("href") === href
-    );
-  }
-
-  let stopRequested = false;
-
   async function processEntry(entry) {
-    const { index, oldUrl, newUrl } = entry;
-    upsertRow({ index, status: "pending" });
+    setRowStatus(entry, "pending", undefined);
 
-    const link = findLinkByHref(oldUrl);
-    if (!link) {
-      upsertRow({ index, status: "error", message: "link not found on page (did the page change since scan?)" });
+    // Operate on the element captured at scan time — not a fresh href
+    // lookup — so this is unambiguous even when several links share a href.
+    const link = entry.link;
+    if (!link.isConnected) {
+      setRowStatus(entry, "error", "link not found on page (did the page change since scan?)");
       return false;
     }
 
@@ -356,45 +378,43 @@
 
     const editBtn = await waitFor(() => document.querySelector(SELECTORS.editBtn));
     if (!editBtn) {
-      upsertRow({ index, status: "error", message: "edit-link button not found" });
+      setRowStatus(entry, "error", "edit-link button not found");
       return false;
     }
     doClick(editBtn);
 
     const urlInput = await waitFor(() => document.querySelector(SELECTORS.urlInput));
     if (!urlInput) {
-      upsertRow({ index, status: "error", message: "url input not found" });
+      setRowStatus(entry, "error", "url input not found");
       return false;
     }
 
     urlInput.focus();
     urlInput.setSelectionRange(0, urlInput.value.length);
-    document.execCommand("insertText", false, newUrl);
+    document.execCommand("insertText", false, entry.newUrl);
     await sleep(STEP_DELAY);
 
     const saveBtn = await waitFor(() => document.querySelector(SELECTORS.saveBtn));
     if (!saveBtn) {
-      upsertRow({ index, status: "error", message: "save button not found" });
+      setRowStatus(entry, "error", "save button not found");
       return false;
     }
     doClick(saveBtn);
     await sleep(STEP_DELAY);
 
-    upsertRow({ index, status: "success", message: "updated" });
+    setRowStatus(entry, "success", "updated");
     return true;
   }
 
   async function run() {
-    const plan = getPlanFromTable();
+    const plan = state.rows.filter((entry) => entry.oldUrl && entry.newUrl);
     if (plan.length === 0) {
       setStatus("Run a scan first, review/tweak the New URL values, then Run.");
       return;
     }
 
-    const config = getConfig();
-    saveSettings(config);
-
-    stopRequested = false;
+    saveSettings();
+    state.stopRequested = false;
     setRowsEditable(false);
 
     const total = plan.length;
@@ -402,7 +422,7 @@
     let done = 0;
 
     for (const entry of plan) {
-      if (stopRequested) {
+      if (state.stopRequested) {
         setStatus("Stopped by user.");
         break;
       }
@@ -418,7 +438,7 @@
   els.scanBtn.addEventListener("click", scan);
   els.runBtn.addEventListener("click", run);
   els.stopBtn.addEventListener("click", () => {
-    stopRequested = true;
+    state.stopRequested = true;
     setStatus("Stop signal sent.");
   });
   els.clearBtn.addEventListener("click", clearLog);
